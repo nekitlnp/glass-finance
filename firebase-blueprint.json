@@ -1,0 +1,60 @@
+{
+  "entities": {
+    "Category": {
+      "title": "Category",
+      "description": "Monthly budget limit category details associated with a user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for the category" },
+        "name": { "type": "string", "description": "Display name of the category" },
+        "icon": { "type": "string", "description": "Lucide icon name representation" },
+        "monthlyLimit": { "type": "number", "description": "Limit set for the category in the month" },
+        "rolloverPreviousMonth": { "type": "number", "description": "Sum carried over from the previous billing month" }
+      },
+      "required": ["id", "name", "icon", "monthlyLimit", "rolloverPreviousMonth"]
+    },
+    "Expense": {
+      "title": "Expense",
+      "description": "Spent transaction entry logged by a user under a specific category",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for the expense" },
+        "categoryId": { "type": "string", "description": "Reference category ID" },
+        "amount": { "type": "number", "description": "Amount spent in the default currency" },
+        "date": { "type": "string", "format": "date", "description": "ISO date YYYY-MM-DD" },
+        "description": { "type": "string", "description": "Description note of the expense transaction" }
+      },
+      "required": ["id", "categoryId", "amount", "date", "description"]
+    },
+    "AdditionalIncome": {
+      "title": "AdditionalIncome",
+      "description": "Supplementary income entry distributed equally across specific category targets",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for the income transaction" },
+        "amount": { "type": "number", "description": "Amount logged as supplementary income" },
+        "date": { "type": "string", "format": "date", "description": "ISO date YYYY-MM-DD" },
+        "description": { "type": "string", "description": "Source or short description of the income source" },
+        "distributedTo": {
+          "type": "array",
+          "description": "Target category IDs over which the income is distributed"
+        }
+      },
+      "required": ["id", "amount", "date", "description", "distributedTo"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/categories/{categoryId}": {
+      "schema": "Category",
+      "description": "Secure subcollection containing personalized user categories and limit policies"
+    },
+    "/users/{userId}/expenses/{expenseId}": {
+      "schema": "Expense",
+      "description": "Secure subcollection of expenses registered by the authentic user"
+    },
+    "/users/{userId}/incomes/{incomeId}": {
+      "schema": "AdditionalIncome",
+      "description": "Secure subcollection of supplementary incomes registered by the authentic user"
+    }
+  }
+}

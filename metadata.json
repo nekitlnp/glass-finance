@@ -1,0 +1,8 @@
+{
+  "name": "Glass Finance v.6",
+  "description": "Премиальное мобильное веб-приложение для учета личных финансов в стиле Liquid Glass с распределением дополнительных доходов.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

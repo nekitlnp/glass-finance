@@ -1,0 +1,75 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 1. Global Safety Net (default-deny catch-all)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Secure namespace under each matching userId
+    match /users/{userId} {
+      // User meta gets created when logging in
+      allow get, write: if isOwner(userId);
+
+      // Validation helper for Category structures
+      function isValidCategory(data) {
+        return data.id is string && data.id.size() <= 128
+          && data.name is string && data.name.size() <= 100
+          && data.icon is string && data.icon.size() <= 60
+          && data.monthlyLimit is number && data.monthlyLimit >= 0
+          && data.rolloverPreviousMonth is number;
+      }
+
+      match /categories/{categoryId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(categoryId) && isValidCategory(request.resource.data);
+        allow update: if isOwner(userId) && isValidCategory(request.resource.data);
+      }
+
+      // Validation helper for Expense transaction data
+      function isValidExpense(data) {
+        return data.id is string && data.id.size() <= 128
+          && data.categoryId is string && data.categoryId.size() <= 128
+          && data.amount is number && data.amount > 0
+          && data.date is string && data.date.size() == 10
+          && data.description is string && data.description.size() <= 200;
+      }
+
+      match /expenses/{expenseId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(expenseId) && isValidExpense(request.resource.data);
+        allow update: if isOwner(userId) && isValidExpense(request.resource.data);
+      }
+
+      // Validation helper for AdditionalIncome transaction data
+      function isValidIncome(data) {
+        return data.id is string && data.id.size() <= 128
+          && data.amount is number && data.amount > 0
+          && data.date is string && data.date.size() == 10
+          && data.description is string && data.description.size() <= 200
+          && data.distributedTo is list && data.distributedTo.size() <= 100
+          && (data.distributedTo.size() == 0 || data.distributedTo[0] is string);
+      }
+
+      match /incomes/{incomeId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(incomeId) && isValidIncome(request.resource.data);
+        allow update: if isOwner(userId) && isValidIncome(request.resource.data);
+      }
+    }
+  }
+}
