@@ -26,19 +26,126 @@ import {
   Database,
   RefreshCw,
   Upload,
-  BookOpen
+  BookOpen,
+  CloudOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { formatMoney, calculateCategoriesForMonth, getCurrencySymbol } from './utils/finance';
+import { formatMoney, calculateCategoriesForMonth, getCurrencySymbol, currentLocalMonth } from './utils/finance';
 import { LanguageCode, TRANSLATIONS, getMonthLocalizedName } from './utils/translations';
 
 interface ToastType {
   id: string;
   message: string;
   type: 'warning' | 'info' | 'success';
+  title?: string;
 }
 
 type ThemeMode = 'dark' | 'light' | 'system';
+
+// ------------ GOOGLE SHEETS TRANSPORT ------------
+const SYNC_DIRTY_KEY = 'glass_finance_sync_dirty';
+const LAST_SYNC_KEY = 'glass_finance_last_sync_at';
+
+interface SheetData {
+  categories: Category[];
+  expenses: Expense[];
+  incomes: AdditionalIncome[];
+}
+
+/** The script answered, and the answer was "error": the sheet did not accept the data. */
+class SheetRejectedError extends Error {}
+
+const isValidScriptUrl = (url: string) =>
+  url.length > 5 && (url.startsWith('http://') || url.startsWith('https://'));
+
+function normalizeSheetResponse(res: any): { data: SheetData; generatedIds: boolean } {
+  let generatedIds = false;
+  const makeId = (prefix: string) => {
+    generatedIds = true;
+    return `${prefix}-${Date.now()}-${Math.random()}`;
+  };
+
+  const categories = (res.categories || []).map((c: any) => ({
+    ...c,
+    id: (!c.id || c.id === 'undefined') ? makeId('cat') : String(c.id),
+    name: (!c.name || c.name === 'undefined') ? 'Без названия' : String(c.name),
+    icon: (!c.icon || c.icon === 'undefined') ? 'ShoppingCart' : String(c.icon),
+    monthlyLimit: Number(c.monthlyLimit) || 0,
+    rolloverPreviousMonth: Number(c.rolloverPreviousMonth) || 0,
+    percentage: Number(c.percentage) || 0
+  }));
+
+  const expenses = (res.expenses || []).map((e: any) => ({
+    ...e,
+    id: (!e.id || e.id === 'undefined') ? makeId('exp') : String(e.id),
+    categoryId: (!e.categoryId || e.categoryId === 'undefined') ? '' : String(e.categoryId),
+    amount: Number(e.amount) || 0,
+    date: (!e.date || e.date === 'undefined') ? '' : String(e.date),
+    description: (!e.description || e.description === 'undefined') ? '' : String(e.description),
+  }));
+
+  const incomes = (res.incomes || []).map((i: any) => ({
+    ...i,
+    id: (!i.id || i.id === 'undefined') ? makeId('inc') : String(i.id),
+    amount: Number(i.amount) || 0,
+    date: (!i.date || i.date === 'undefined') ? '' : String(i.date),
+    description: (!i.description || i.description === 'undefined') ? '' : String(i.description),
+  }));
+
+  return { data: { categories, expenses, incomes }, generatedIds };
+}
+
+async function readSheet(url: string): Promise<{ data: SheetData; generatedIds: boolean }> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const res = await response.json();
+  if (res.status !== 'success') {
+    throw new Error(res.message || 'Error fetching data');
+  }
+  return normalizeSheetResponse(res);
+}
+
+const totalInCents = (items: { amount: number }[]) =>
+  Math.round(items.reduce((sum, item) => sum + (Number(item.amount) || 0), 0) * 100);
+
+/**
+ * Saves everything to the sheet and resolves only when the save is confirmed.
+ * Throws when the sheet could not be reached or did not accept the data.
+ */
+async function writeSheet(url: string, payload: SheetData): Promise<void> {
+  const body = JSON.stringify(payload);
+  const headers = { 'Content-Type': 'text/plain;charset=utf-8' };
+
+  // 1. A regular request: the script answers with JSON, so a failed save is visible.
+  try {
+    const response = await fetch(url, { method: 'POST', headers, body });
+    if (response.ok) {
+      const res = JSON.parse(await response.text());
+      if (res && res.status === 'success') return;
+      if (res && res.status === 'error') {
+        throw new SheetRejectedError(res.message || 'Sheet error');
+      }
+    }
+  } catch (err) {
+    if (err instanceof SheetRejectedError) throw err;
+    // The answer could not be read (blocked by the browser, or no network). Try the blind way below.
+  }
+
+  // 2. A blind request (how the app used to save), then read the sheet back to confirm it.
+  await fetch(url, { method: 'POST', mode: 'no-cors', headers, body });
+  const { data } = await readSheet(url);
+  const confirmed =
+    data.categories.length === payload.categories.length &&
+    data.expenses.length === payload.expenses.length &&
+    data.incomes.length === payload.incomes.length &&
+    totalInCents(data.expenses) === totalInCents(payload.expenses) &&
+    totalInCents(data.incomes) === totalInCents(payload.incomes);
+  if (!confirmed) {
+    throw new Error('SHEET_MISMATCH');
+  }
+}
 
 export default function App() {
   // 1. Core Reactive States
@@ -88,126 +195,217 @@ export default function App() {
     }
   });
 
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'pending' | 'success'>('idle');
-  const [hasUserModified, setHasUserModified] = useState(false);
-  const syncSuccessTimeoutRef = useRef<any>(null);
-
-  const markUserModified = () => {
-    setHasUserModified(true);
-    setIsInitialLoad(false);
-    if (scriptUrl.length > 5 && (scriptUrl.startsWith('http') || scriptUrl.startsWith('https'))) {
-      setSyncStatus('pending');
+  // ------------ SYNC STATE ------------
+  // "dirty" = the device has changes the sheet has not confirmed yet. It is kept in localStorage,
+  // so an unsent change survives closing the app and is sent again on the next launch
+  // instead of being overwritten by an older copy from the sheet.
+  const [dirty, setDirtyState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SYNC_DIRTY_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const dirtyRef = useRef(dirty);
+  const setDirty = (value: boolean) => {
+    dirtyRef.current = value;
+    setDirtyState(value);
+    try {
+      if (value) {
+        localStorage.setItem(SYNC_DIRTY_KEY, 'true');
+      } else {
+        localStorage.removeItem(SYNC_DIRTY_KEY);
+      }
+    } catch (e) {
+      console.error('Failed to write sync flag to localStorage:', e);
     }
   };
 
-  const isSyncConfigured = scriptUrl.length > 5 && (scriptUrl.startsWith('http://') || scriptUrl.startsWith('https://'));
+  const [syncPhase, setSyncPhase] = useState<'idle' | 'loading' | 'saving'>('idle');
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(() => {
+    try {
+      return Number(localStorage.getItem(LAST_SYNC_KEY)) || null;
+    } catch {
+      return null;
+    }
+  });
+  // Bumped to ask for a save to the sheet (debounced below)
+  const [saveRequest, setSaveRequest] = useState(0);
+
+  // Latest values for async code, which would otherwise see a stale render
+  const dataRef = useRef<SheetData>({ categories, expenses, incomes });
+  dataRef.current = { categories, expenses, incomes };
+  const scriptUrlRef = useRef(scriptUrl);
+  scriptUrlRef.current = scriptUrl;
+  const revisionRef = useRef(0); // grows with every local change
+  const saveInFlightRef = useRef(false);
+  const saveAgainRef = useRef(false);
+  const loadInFlightRef = useRef(false);
+
+  const isSyncConfigured = isValidScriptUrl(scriptUrl);
+
+  const requestSave = () => {
+    revisionRef.current += 1;
+    setDirty(true);
+    setSaveRequest(n => n + 1);
+  };
+
+  // A fresh change gets a fresh attempt: forget an older "sheet unreachable" result
+  const clearStaleSyncError = () => {
+    if (!dirtyRef.current) {
+      setSyncError(null);
+    }
+  };
+
+  const markUserModified = () => {
+    if (isValidScriptUrl(scriptUrlRef.current)) {
+      clearStaleSyncError();
+      requestSave();
+    } else {
+      revisionRef.current += 1;
+    }
+  };
+
+  const markSynced = () => {
+    const now = Date.now();
+    setLastSyncAt(now);
+    try {
+      localStorage.setItem(LAST_SYNC_KEY, String(now));
+    } catch (e) {
+      console.error('Failed to write sync time to localStorage:', e);
+    }
+  };
+
+  const describeSyncError = (err: any): string => {
+    const isRu = language === 'RU';
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      return isRu ? 'нет подключения к интернету' : 'no internet connection';
+    }
+    const message = String(err?.message || '');
+    if (message === 'SHEET_MISMATCH') {
+      return isRu ? 'таблица ответила, но данные в ней не совпали с отправленными' : 'the sheet answered, but its data does not match what was sent';
+    }
+    if (!message || message === 'Failed to fetch' || message === 'Load failed' || message.startsWith('NetworkError')) {
+      return isRu ? 'таблица не отвечает' : 'the sheet is not responding';
+    }
+    return message;
+  };
 
   // Load from Sheets
   const fetchFromSheets = async (showToastOnSuccess = false, targetUrl?: string) => {
-    const activeUrl = targetUrl || scriptUrl;
-    const isUrlValid = activeUrl.length > 5 && (activeUrl.startsWith('http://') || activeUrl.startsWith('https://'));
-    if (!isUrlValid) return;
-    setIsSyncing(true);
+    const activeUrl = targetUrl || scriptUrlRef.current;
+    if (!isValidScriptUrl(activeUrl)) return;
+    if (loadInFlightRef.current) return;
+    loadInFlightRef.current = true;
+    setSyncPhase('loading');
+    const revisionAtStart = revisionRef.current;
     try {
-      const response = await fetch(activeUrl);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const res = await response.json();
-      if (res.status === 'success') {
-        const safeCategories = (res.categories || []).map((c: any) => ({
-          ...c,
-          id: (!c.id || c.id === 'undefined') ? `cat-${Date.now()}-${Math.random()}` : String(c.id),
-          name: (!c.name || c.name === 'undefined') ? 'Без названия' : String(c.name),
-          icon: (!c.icon || c.icon === 'undefined') ? 'ShoppingCart' : String(c.icon),
-          monthlyLimit: Number(c.monthlyLimit) || 0,
-          rolloverPreviousMonth: Number(c.rolloverPreviousMonth) || 0,
-          percentage: Number(c.percentage) || 0
-        }));
-        
-        const safeExpenses = (res.expenses || []).map((e: any) => ({
-          ...e,
-          id: (!e.id || e.id === 'undefined') ? `exp-${Date.now()}-${Math.random()}` : String(e.id),
-          categoryId: (!e.categoryId || e.categoryId === 'undefined') ? '' : String(e.categoryId),
-          amount: Number(e.amount) || 0,
-          date: (!e.date || e.date === 'undefined') ? '' : String(e.date),
-          description: (!e.description || e.description === 'undefined') ? '' : String(e.description),
-        }));
-        
-        const safeIncomes = (res.incomes || []).map((i: any) => ({
-          ...i,
-          id: (!i.id || i.id === 'undefined') ? `inc-${Date.now()}-${Math.random()}` : String(i.id),
-          amount: Number(i.amount) || 0,
-          date: (!i.date || i.date === 'undefined') ? '' : String(i.date),
-          description: (!i.description || i.description === 'undefined') ? '' : String(i.description),
-        }));
+      const { data, generatedIds } = await readSheet(activeUrl);
+      const local = dataRef.current;
+      const sheetIsEmpty = data.categories.length === 0 && data.expenses.length === 0 && data.incomes.length === 0;
+      const deviceHasData = local.categories.length > 0 || local.expenses.length > 0 || local.incomes.length > 0;
 
-        if (hasUserModified && !showToastOnSuccess) {
-          console.log('Skipping sheet overwrite as user has modified data in this session');
-        } else {
-          setCategories(safeCategories);
-          setExpenses(safeExpenses);
-          setIncomes(safeIncomes);
-          if (showToastOnSuccess) {
-            showToast(
-              language === 'RU' 
-                ? 'Данные успешно загружены из Google Таблицы!' 
-                : 'Data successfully loaded from Google Sheets!',
-              'info'
-            );
-          }
+      if (dirtyRef.current || revisionRef.current !== revisionAtStart) {
+        // Something was changed on the device while the sheet was loading: the device copy is newer
+        console.log('Skipping sheet overwrite as user has modified data in this session');
+        requestSave();
+      } else if (sheetIsEmpty && deviceHasData) {
+        // Never replace real data with an empty sheet (a freshly connected one, for example): fill the sheet instead
+        requestSave();
+        if (showToastOnSuccess) {
+          showToast(
+            language === 'RU'
+              ? 'Таблица пустая — данные с этого устройства отправляются в неё.'
+              : 'The sheet is empty — the data from this device is being sent to it.',
+            'info'
+          );
         }
       } else {
-        throw new Error(res.message || 'Error fetching data');
+        setCategories(data.categories);
+        setExpenses(data.expenses);
+        setIncomes(data.incomes);
+        markSynced();
+        if (generatedIds) {
+          // Rows typed into the sheet by hand got ids just now: store them in the sheet
+          requestSave();
+        }
+        if (showToastOnSuccess) {
+          showToast(
+            language === 'RU' 
+              ? 'Данные успешно загружены из Google Таблицы!' 
+              : 'Data successfully loaded from Google Sheets!',
+            'info'
+          );
+        }
       }
+      setSyncError(null);
     } catch (err: any) {
       console.error('Sheets Fetch Error:', err);
+      const reason = describeSyncError(err);
+      setSyncError(reason);
       showToast(
         language === 'RU'
-          ? `Ошибка загрузки из Таблицы: ${err.message || 'Ошибка сети'}`
-          : `Spreadsheet load error: ${err.message || 'Network error'}`,
-        'warning'
+          ? `Не удалось загрузить данные из таблицы: ${reason}. Показано то, что сохранено на устройстве.`
+          : `Could not load data from the sheet: ${reason}. Showing what is saved on this device.`,
+        'warning',
+        language === 'RU' ? 'Google Таблица' : 'Google Sheets'
       );
     } finally {
-      setIsInitialLoad(false);
-      setIsSyncing(false);
+      loadInFlightRef.current = false;
+      setSyncPhase('idle');
     }
   };
 
-  // Save to Sheets
-  const syncToSheets = async (cats: Category[], exps: Expense[], incs: AdditionalIncome[]) => {
-    if (!isSyncConfigured) return;
-    setIsSyncing(true);
-    setSyncStatus('pending');
+  // Save to Sheets. Resolves to true only when the sheet confirmed the save.
+  const saveToSheets = async (): Promise<boolean> => {
+    const url = scriptUrlRef.current;
+    if (!isValidScriptUrl(url)) return false;
+    if (saveInFlightRef.current) {
+      saveAgainRef.current = true;
+      return false;
+    }
+    saveInFlightRef.current = true;
+    setSyncPhase('saving');
+    const revision = revisionRef.current;
+    let confirmed = false;
     try {
-      await fetch(scriptUrl, {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: {
-          'Content-Type': 'text/plain;charset=utf-8'
-        },
-        body: JSON.stringify({
-          categories: cats,
-          expenses: exps,
-          incomes: incs
-        })
-      });
-      setSyncStatus('success');
-
-      if (syncSuccessTimeoutRef.current) {
-        clearTimeout(syncSuccessTimeoutRef.current);
+      await writeSheet(url, dataRef.current);
+      confirmed = true;
+      setSyncError(null);
+      markSynced();
+      if (revisionRef.current === revision) {
+        setDirty(false);
       }
-      syncSuccessTimeoutRef.current = setTimeout(() => {
-        setSyncStatus('idle');
-      }, 3000);
     } catch (err: any) {
       console.error('Sheets Sync Error:', err);
-      setSyncStatus('idle');
+      setSyncError(describeSyncError(err));
     } finally {
-      setIsSyncing(false);
+      saveInFlightRef.current = false;
+      setSyncPhase('idle');
+      const changedMeanwhile = confirmed && revisionRef.current !== revision;
+      if (saveAgainRef.current || changedMeanwhile) {
+        saveAgainRef.current = false;
+        setSaveRequest(n => n + 1);
+      }
     }
+    return confirmed;
+  };
+
+  // The "sync now" action: send unsent changes first, otherwise reload from the sheet
+  const handleManualSync = async () => {
+    if (!isSyncConfigured || syncPhase !== 'idle') return;
+    if (dirtyRef.current) {
+      const confirmed = await saveToSheets();
+      if (confirmed) {
+        showToast(
+          language === 'RU' ? 'Изменения отправлены в Google Таблицу.' : 'Changes sent to Google Sheets.',
+          'success'
+        );
+      }
+      return;
+    }
+    await fetchFromSheets(true);
   };
 
   // Currency State: RUB, USD, EUR, KZT, BYN, UAH
@@ -252,22 +450,50 @@ export default function App() {
   // Toast Notifications State
   const [toasts, setToasts] = useState<ToastType[]>([]);
 
-  const showToast = (message: string, type: 'warning' | 'info' | 'success' = 'warning') => {
-    const id = `toast-${Date.now()}`;
-    setToasts(prev => [...prev, { id, message, type }]);
+  const showToast = (message: string, type: 'warning' | 'info' | 'success' = 'warning', title?: string) => {
+    const id = `toast-${Date.now()}-${Math.random()}`;
+    setToasts(prev => [...prev, { id, message, type, title }]);
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id));
     }, 6000);
   };
 
-  // 2. Trigger Initial Fetch from Sheets on Mount
+  // 2. On launch (and when the link changes): unsent changes go to the sheet first, otherwise load from it
   useEffect(() => {
-    if (isSyncConfigured) {
-      fetchFromSheets(false);
+    if (!isSyncConfigured) return;
+    if (dirtyRef.current) {
+      saveToSheets();
     } else {
-      setIsInitialLoad(false);
+      fetchFromSheets(false);
     }
   }, [scriptUrl]);
+
+  // Retry unsent changes when the connection or the app comes back, and every 30 seconds
+  useEffect(() => {
+    if (!isSyncConfigured) return;
+    const retry = () => {
+      if (dirtyRef.current && !saveInFlightRef.current) {
+        saveToSheets();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') retry();
+    };
+    window.addEventListener('online', retry);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    const timer = setInterval(retry, 30000);
+    return () => {
+      window.removeEventListener('online', retry);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      clearInterval(timer);
+    };
+  }, [isSyncConfigured]);
+
+  // Every screen opens from the top
+  useEffect(() => {
+    window.scrollTo(0, 0);
+    document.querySelector('main')?.scrollTo(0, 0);
+  }, [activeTab]);
 
   // Resolve design style based on selection
   useEffect(() => {
@@ -307,17 +533,19 @@ export default function App() {
     };
   }, [showMonthPicker, showSettings]);
 
-  // 3. Save State to LocalStorage and auto-save list states to Google Sheets
+  // 3. Save State to LocalStorage
   useEffect(() => {
     saveState({ categories, expenses, incomes, currentMonth });
+  }, [categories, expenses, incomes, currentMonth]);
 
-    if (isSyncConfigured && !isInitialLoad) {
-      const dbnc = setTimeout(() => {
-        syncToSheets(categories, expenses, incomes);
-      }, 1200);
-      return () => clearTimeout(dbnc);
-    }
-  }, [categories, expenses, incomes, currentMonth, isInitialLoad, isSyncConfigured]);
+  // 4. Send changes to Google Sheets shortly after the last edit
+  useEffect(() => {
+    if (saveRequest === 0) return;
+    const dbnc = setTimeout(() => {
+      saveToSheets();
+    }, 1200);
+    return () => clearTimeout(dbnc);
+  }, [saveRequest]);
 
   const handleUpdateCurrency = (newCurrency: string) => {
     setCurrencyCode(newCurrency);
@@ -357,7 +585,8 @@ export default function App() {
             formatMoney(matchedCat.totalRemaining, currencyCode),
             matchedCat.name
           ),
-          'warning'
+          'warning',
+          TRANSLATIONS[language].limitExceededTitle
         );
       }
     }
@@ -392,7 +621,7 @@ export default function App() {
 
   // Switch month-year
   const handleNextMonth = () => {
-    const todayStr = new Date().toISOString().substring(0, 7);
+    const todayStr = currentLocalMonth();
     if (currentMonth >= todayStr) return;
 
     const [year, month] = currentMonth.split('-').map(Number);
@@ -421,6 +650,79 @@ export default function App() {
 
   const getMonthRussianName = (key: string) => {
     return getMonthLocalizedName(key, language);
+  };
+
+  // ------------ SYNC INDICATOR (shown in the header on every screen) ------------
+  const isRu = language === 'RU';
+  const formatSyncTime = (timestamp: number) => {
+    const date = new Date(timestamp);
+    const locale = isRu ? 'ru-RU' : 'en-GB';
+    const time = date.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
+    if (date.toDateString() === new Date().toDateString()) return time;
+    return `${date.toLocaleDateString(locale, { day: '2-digit', month: '2-digit' })} ${time}`;
+  };
+
+  type SyncIndicator = 'local' | 'loading' | 'saving' | 'unsynced' | 'unreachable' | 'synced';
+  const syncIndicator: SyncIndicator = !isSyncConfigured
+    ? 'local'
+    : syncPhase === 'loading'
+      ? 'loading'
+      : dirty && syncError
+        ? 'unsynced'      // changes on the device that the sheet did not confirm
+        : syncPhase === 'saving' || dirty
+          ? 'saving'
+          : syncError
+            ? 'unreachable' // nothing unsent, but the last load from the sheet failed
+            : 'synced';
+
+  const syncIndicatorView: Record<SyncIndicator, { label: string; hint: string; tone: string; icon: React.ReactNode }> = {
+    local: {
+      label: isRu ? 'Только на устройстве' : 'On this device only',
+      hint: isRu ? 'Google Таблица не подключена. Нажмите, чтобы открыть настройки.' : 'No Google Sheet connected. Tap to open settings.',
+      tone: 'text-slate-400',
+      icon: <CloudOff size={11} />
+    },
+    loading: {
+      label: isRu ? 'Загрузка из таблицы…' : 'Loading from the sheet…',
+      hint: '',
+      tone: 'text-indigo-300',
+      icon: <RefreshCw size={11} className="animate-spin" />
+    },
+    saving: {
+      label: isRu ? 'Синхронизация…' : 'Syncing…',
+      hint: '',
+      tone: 'text-indigo-300',
+      icon: <RefreshCw size={11} className="animate-spin" />
+    },
+    unsynced: {
+      label: isRu ? 'Не синхронизировано' : 'Not synced',
+      hint: isRu ? 'Нажмите, чтобы отправить изменения ещё раз.' : 'Tap to send the changes again.',
+      tone: 'text-red-400',
+      icon: <AlertTriangle size={11} />
+    },
+    unreachable: {
+      label: isRu ? 'Нет связи с таблицей' : 'Sheet unreachable',
+      hint: isRu ? 'Нажмите, чтобы попробовать ещё раз.' : 'Tap to try again.',
+      tone: 'text-amber-400',
+      icon: <AlertTriangle size={11} />
+    },
+    synced: {
+      label: lastSyncAt
+        ? `${isRu ? 'Синхронизировано' : 'Synced'} · ${formatSyncTime(lastSyncAt)}`
+        : (isRu ? 'Синхронизировано' : 'Synced'),
+      hint: isRu ? 'Данные совпадают с Google Таблицей. Нажмите, чтобы обновить из таблицы.' : 'Data matches the Google Sheet. Tap to reload from the sheet.',
+      tone: 'text-emerald-400',
+      icon: <CheckCircle2 size={11} />
+    }
+  };
+  const indicator = syncIndicatorView[syncIndicator];
+
+  const handleSyncIndicatorClick = () => {
+    if (!isSyncConfigured) {
+      setShowSettings(true);
+      return;
+    }
+    handleManualSync();
   };
 
   return (
@@ -462,7 +764,7 @@ export default function App() {
                   )}
                   <div className="flex-1 text-xs text-left">
                     <p className={`font-bold font-display ${isWarning ? 'text-rose-300' : 'text-emerald-300'}`}>
-                      {isWarning ? TRANSLATIONS[language].limitExceededTitle : (language === 'RU' ? 'Успешно' : 'Success')}
+                      {toast.title || (isWarning ? (language === 'RU' ? 'Внимание' : 'Warning') : (language === 'RU' ? 'Успешно' : 'Success'))}
                     </p>
                     <p className={`leading-relaxed mt-0.5 font-sans ${isWarning ? 'text-rose-200/95' : 'text-emerald-200/95'}`}>{toast.message}</p>
                   </div>
@@ -482,17 +784,29 @@ export default function App() {
         <header className="glass-panel sticky top-0 z-40 px-5 py-4 border-b border-white/5 backdrop-blur-xl flex flex-col space-y-3.5 relative">
           <div className="flex items-center justify-between">
             {/* Elegant Application Name */}
-            <div className="flex items-center space-x-2.5">
-              <div className="bg-gradient-to-tr from-indigo-500 to-emerald-400 p-2 rounded-xl shadow-lg shadow-indigo-500/20">
+            <div className="flex items-center space-x-2.5 min-w-0">
+              <div className="bg-gradient-to-tr from-indigo-500 to-emerald-400 p-2 rounded-xl shadow-lg shadow-indigo-500/20 shrink-0">
                 <Wallet size={18} className="text-white" />
               </div>
-              <div>
-                <h1 className="font-extrabold text-base tracking-tight text-white font-display">{TRANSLATIONS[language].appName}</h1>
+              <div className="min-w-0">
+                <h1 className="font-extrabold text-base tracking-tight text-white font-display leading-tight">{TRANSLATIONS[language].appName}</h1>
+                {/* Sync status: always visible, on every screen */}
+                <button
+                  type="button"
+                  onClick={handleSyncIndicatorClick}
+                  title={indicator.hint}
+                  aria-live="polite"
+                  data-sync-state={syncIndicator}
+                  className={`flex items-center space-x-1 max-w-full text-[10px] leading-tight font-medium mt-0.5 cursor-pointer focus:outline-none ${indicator.tone}`}
+                >
+                  <span className="shrink-0">{indicator.icon}</span>
+                  <span className="truncate">{indicator.label}</span>
+                </button>
               </div>
             </div>
 
             {/* Action pill: Clickable Month Selector & Settings Trigger */}
-            <div className="flex items-center space-x-2">
+            <div className="flex items-center space-x-2 shrink-0">
               <button 
                 onClick={() => setShowImportModal(true)}
                 className="flex items-center space-x-1.5 bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded-full border border-white/5 transition duration-150 cursor-pointer text-slate-100 hover:text-emerald-400 select-none focus:outline-none"
@@ -534,46 +848,38 @@ export default function App() {
             </div>
             <button 
               onClick={handleNextMonth}
-              disabled={currentMonth >= new Date().toISOString().substring(0, 7)}
+              disabled={currentMonth >= currentLocalMonth()}
               className="p-2 hover:bg-white/5 rounded-xl text-slate-400 hover:text-white transition cursor-pointer disabled:opacity-20 disabled:pointer-events-none"
             >
               <ChevronRight size={16} />
             </button>
           </div>
 
-          {/* SYNC STATUS BANNER - ABSOLUTE OVERLAY TO AVOID SHIFTING INTERFACE DOWN */}
-          <AnimatePresence>
-            {syncStatus !== 'idle' && (
-              <motion.div
-                initial={{ opacity: 0, y: -20 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -20 }}
-                transition={{ duration: 0.3, ease: 'easeOut' }}
-                className="absolute top-full left-0 right-0 bg-indigo-950/95 border-b border-indigo-500/30 text-indigo-100 z-30 shadow-lg shadow-black/40 backdrop-blur-md"
+          {/* UNSYNCED WARNING - stays until the sheet confirms the changes */}
+          {syncIndicator === 'unsynced' && (
+            <div
+              role="alert"
+              className="flex items-center justify-between gap-3 rounded-2xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5"
+            >
+              <div className="flex items-start space-x-2 min-w-0">
+                <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
+                <p className="text-[11px] leading-snug text-red-200">
+                  {isRu
+                    ? `Изменения сохранены на устройстве, но не попали в Google Таблицу: ${syncError}. Отправка повторится сама.`
+                    : `Changes are saved on this device but have not reached Google Sheets: ${syncError}. Sending will be retried automatically.`}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={syncPhase !== 'idle'}
+                onClick={handleManualSync}
+                className="shrink-0 flex items-center space-x-1 text-[11px] font-semibold text-red-200 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded-full px-3 py-1.5 transition cursor-pointer disabled:opacity-60"
               >
-                <div className="px-5 py-3 flex items-center justify-between text-xs font-sans">
-                  <div className="flex items-center space-x-2.5">
-                    <div className="relative flex h-2 w-2 shrink-0">
-                      {syncStatus === 'pending' ? (
-                        <>
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                          <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-400"></span>
-                        </>
-                      ) : (
-                        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500 animate-pulse"></span>
-                      )}
-                    </div>
-                    <span className="font-semibold text-slate-100">
-                      {syncStatus === 'pending' ? TRANSLATIONS[language].syncBannerPending : TRANSLATIONS[language].syncBannerSuccess}
-                    </span>
-                  </div>
-                  {syncStatus === 'pending' && (
-                    <RefreshCw size={12} className="animate-spin text-indigo-400 shrink-0" />
-                  )}
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+                <RefreshCw size={11} className={syncPhase === 'saving' ? 'animate-spin' : ''} />
+                <span>{isRu ? 'Повторить' : 'Retry'}</span>
+              </button>
+            </div>
+          )}
         </header>
 
         {/* SCROLLABLE INNER VIEWPORT */}
@@ -613,6 +919,7 @@ export default function App() {
                 <ExpensesList
                   categories={categories}
                   expenses={expenses}
+                  currentMonth={currentMonth}
                   onAddExpense={handleAddExpense}
                   onDeleteExpense={handleDeleteExpense}
                   onEditExpense={handleEditExpense}
@@ -794,7 +1101,7 @@ export default function App() {
                   ].map(m => {
                     const combined = `${tempYear}-${m.value}`;
                     const isSelected = currentMonth === combined;
-                    const todayStr = new Date().toISOString().substring(0, 7);
+                    const todayStr = currentLocalMonth();
                     const isFuture = combined > todayStr;
                     
                     return (
@@ -966,13 +1273,19 @@ export default function App() {
                   <div className={`p-4 rounded-2xl border ${isSyncConfigured ? 'bg-indigo-500/5 border-indigo-500/20' : 'bg-slate-950/40 border-white/5'} space-y-3`}>
                     <div className="flex items-center space-x-2.5">
                       <div className={`p-1.5 rounded-xl ${isSyncConfigured ? 'bg-indigo-500/10 text-indigo-400' : 'bg-slate-800 text-slate-400'}`}>
-                        <Cloud size={14} className={isSyncing ? 'animate-bounce' : ''} />
+                        <Cloud size={14} className={syncPhase !== 'idle' ? 'animate-bounce' : ''} />
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-[10px] font-mono leading-none text-slate-400">{TRANSLATIONS[language].firebaseStatusLabel}</p>
                         <p className={`text-xs font-bold truncate mt-0.5 ${isSyncConfigured ? 'text-emerald-400' : 'text-slate-300'}`}>
                           {isSyncConfigured ? TRANSLATIONS[language].firebaseLinked : TRANSLATIONS[language].firebaseLocalMode}
                         </p>
+                        {isSyncConfigured && (
+                          <p className={`text-[10px] mt-1 flex items-center space-x-1 ${indicator.tone}`}>
+                            <span className="shrink-0">{indicator.icon}</span>
+                            <span className="truncate">{indicator.label}</span>
+                          </p>
+                        )}
                       </div>
                     </div>
 
@@ -1042,11 +1355,11 @@ export default function App() {
                     {isSyncConfigured && (
                       <button
                         type="button"
-                        disabled={isSyncing}
-                        onClick={() => fetchFromSheets(true)}
+                        disabled={syncPhase !== 'idle'}
+                        onClick={handleManualSync}
                         className="w-full py-2.5 font-semibold text-xs rounded-xl bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white border border-indigo-400 transition duration-150 cursor-pointer shadow-lg shadow-indigo-500/10 flex items-center justify-center space-x-1.5 font-display"
                       >
-                        <RefreshCw size={12} className={isSyncing ? 'animate-spin' : ''} />
+                        <RefreshCw size={12} className={syncPhase !== 'idle' ? 'animate-spin' : ''} />
                         <span>{TRANSLATIONS[language].firebaseSignInBtn}</span>
                       </button>
                     )}

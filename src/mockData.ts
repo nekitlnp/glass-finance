@@ -1,4 +1,5 @@
 import { Category, Expense, AdditionalIncome } from './types';
+import { currentLocalMonth } from './utils/finance';
 
 export const INITIAL_CATEGORIES: Category[] = [];
 export const INITIAL_EXPENSES: Expense[] = [];
@@ -18,7 +19,7 @@ export function loadState() {
     const incomesStr = localStorage.getItem(STORAGE_KEYS.INCOMES);
     const currentMonthStr = localStorage.getItem(STORAGE_KEYS.CURRENT_MONTH);
 
-    const defaultMonth = new Date().toISOString().substring(0, 7);
+    const defaultMonth = currentLocalMonth();
 
     return {
       categories: categoriesStr ? JSON.parse(categoriesStr) : INITIAL_CATEGORIES,
@@ -28,7 +29,7 @@ export function loadState() {
     };
   } catch (e) {
     console.error('Failed to read from localStorage:', e);
-    const defaultMonth = new Date().toISOString().substring(0, 7);
+    const defaultMonth = currentLocalMonth();
     return {
       categories: INITIAL_CATEGORIES,
       expenses: INITIAL_EXPENSES,
