@@ -240,7 +240,7 @@ export function calculateCategoriesForMonth(
     // 3. Остаток: Лимит - Текущие_Расходы
     const remaining = (limits[targetMonth]?.[cat.id] ?? 0) - currentExpenses;
 
-    // 4. Ролловер с прошлого месяца
+    // 4. Остаток, перенесённый с прошлого месяца
     const rolloverPreviousMonth = rollovers[targetMonth]?.[cat.id] ?? 0;
 
     // 5. Остаток_Всего: Остаток + Остаток_Прошлый_Месяц
@@ -256,4 +256,96 @@ export function calculateCategoriesForMonth(
       totalRemaining
     };
   });
+}
+
+/**
+ * Today's date in the device's own time zone (YYYY-MM-DD).
+ * `toISOString()` is UTC, so around midnight it returns yesterday's date (and, on the 1st, last month).
+ */
+export function todayLocalISO(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/** Current calendar month in the device's own time zone (YYYY-MM). */
+export function currentLocalMonth(): string {
+  return todayLocalISO().substring(0, 7);
+}
+
+export function roundMoney(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/**
+ * How much of a category's money is spent this month.
+ * "Available" is everything the category can spend this month: the month's limit, additional income
+ * and the balance carried over from previous months. Using only the month's limit breaks at the start
+ * of a month: until income is entered the limit is 0 and any expense reads as 100%.
+ */
+export function getCategoryUsage(cat: CategoryWithCalculations): {
+  available: number;
+  pct: number;
+  overspent: boolean;
+} {
+  const available = cat.monthlyLimit + cat.currentAdditional + cat.rolloverPreviousMonth;
+  const overspent = cat.currentExpenses > 0 && cat.currentExpenses > available;
+  let pct = 0;
+  if (cat.currentExpenses > 0) {
+    pct = available > 0 ? Math.min(100, (cat.currentExpenses / available) * 100) : 100;
+  }
+  return { available, pct, overspent };
+}
+
+/** Sum of primary income entered for a month (YYYY-MM). */
+export function getPrimaryIncomeForMonth(incomes: AdditionalIncome[], month: string): number {
+  return incomes
+    .filter(inc => (inc.type === 'primary' || inc.type === undefined) && inc.date.startsWith(month))
+    .reduce((sum, inc) => sum + inc.amount, 0);
+}
+
+export type IncomeBaseSource = 'month' | 'last' | 'planned' | 'none';
+
+/**
+ * Monthly income used to convert a category's amount to a share and back.
+ * Order: primary income of the viewed month, else the latest month that has primary income,
+ * else the income the user typed in earlier, else nothing.
+ */
+export function getIncomeBase(
+  incomes: AdditionalIncome[],
+  month: string,
+  plannedIncome: number
+): { amount: number; source: IncomeBaseSource; month?: string } {
+  const forMonth = getPrimaryIncomeForMonth(incomes, month);
+  if (forMonth > 0) {
+    return { amount: roundMoney(forMonth), source: 'month', month };
+  }
+
+  const months = Array.from(
+    new Set(
+      incomes
+        .filter(inc => (inc.type === 'primary' || inc.type === undefined) && inc.date.length >= 7)
+        .map(inc => inc.date.substring(0, 7))
+    )
+  ).sort();
+  for (let i = months.length - 1; i >= 0; i--) {
+    const total = getPrimaryIncomeForMonth(incomes, months[i]);
+    if (total > 0) {
+      return { amount: roundMoney(total), source: 'last', month: months[i] };
+    }
+  }
+
+  if (plannedIncome > 0) {
+    return { amount: roundMoney(plannedIncome), source: 'planned' };
+  }
+  return { amount: 0, source: 'none' };
+}
+
+/** Parses user-typed numbers: "15 000,50" => 15000.5. Returns NaN for anything that is not a number. */
+export function parseAmountInput(raw: string): number {
+  const cleaned = raw.replace(/\s/g, '').replace(',', '.');
+  if (cleaned === '') return NaN;
+  return Number(cleaned);
 }

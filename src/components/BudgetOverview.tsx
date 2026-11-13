@@ -1,8 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { Category, Expense, AdditionalIncome, CategoryWithCalculations } from '../types';
-import { formatMoney, calculateCategoriesForMonth, getCurrencySymbol } from '../utils/finance';
+import {
+  formatMoney,
+  calculateCategoriesForMonth,
+  getCategoryUsage,
+  getPrimaryIncomeForMonth,
+  roundMoney
+} from '../utils/finance';
 import CategoryIcon, { AVAILABLE_ICONS } from './CategoryIcon';
-import { Info, Plus, Pencil, X, Save, FolderPlus, HelpCircle } from 'lucide-react';
+import CategoryShareFields from './CategoryShareFields';
+import { Info, Plus, Pencil, X, Save, FolderPlus, ArrowUpDown, ChevronUp, ChevronDown } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { LanguageCode, TRANSLATIONS, getLocalizedCategoryName } from '../utils/translations';
 
@@ -30,17 +37,20 @@ export default function BudgetOverview({
   
   // State for adding a new category
   const [newCatName, setNewCatName] = useState('');
-  const [newCatLimit, setNewCatLimit] = useState('');
+  const [newCatPercent, setNewCatPercent] = useState<number | null>(null);
   const [newCatIcon, setNewCatIcon] = useState('ShoppingCart');
 
   // State for updating values of an existing category
   const [editName, setEditName] = useState('');
-  const [editLimit, setEditLimit] = useState('');
+  const [editPercent, setEditPercent] = useState<number | null>(null);
   const [editIcon, setEditIcon] = useState('');
 
-  // Lock scrolling when category forms (Add/Edit modals) are shown
+  // Draft order of category ids while the "Category order" modal is open
+  const [orderDraft, setOrderDraft] = useState<string[] | null>(null);
+
+  // Lock scrolling when category forms (Add/Edit/Order modals) are shown
   useEffect(() => {
-    const isModalOpen = showAddCategory || editingCategory !== null;
+    const isModalOpen = showAddCategory || editingCategory !== null || orderDraft !== null;
     const scrollContainer = document.querySelector('main');
     if (isModalOpen) {
       document.body.style.overflow = 'hidden';
@@ -59,7 +69,7 @@ export default function BudgetOverview({
         scrollContainer.style.overflow = '';
       }
     };
-  }, [showAddCategory, editingCategory]);
+  }, [showAddCategory, editingCategory, orderDraft]);
 
   // 1. Calculate and derive values for all categories in the active month
   const categoriesWithCalculations = calculateCategoriesForMonth(
@@ -79,12 +89,15 @@ export default function BudgetOverview({
   const totalRemainingBalance = categoriesWithCalculations.reduce((sum, c) => sum + c.totalRemaining, 0);
 
   // Total allocated percentage across categories
-  const totalPercentage = categories.reduce((sum, c) => sum + (c.percentage ?? 0), 0);
+  const totalPercentage = roundMoney(categories.reduce((sum, c) => sum + (c.percentage ?? 0), 0));
+
+  // Limits come from primary income entered for the month, so they stay at zero until it is entered
+  const hasPrimaryIncomeThisMonth = getPrimaryIncomeForMonth(incomes, currentMonth) > 0;
 
   const handleEditCategory = (cat: Category) => {
     setEditingCategory(cat);
     setEditName(cat.name);
-    setEditLimit((cat.percentage ?? 0).toString());
+    setEditPercent(cat.percentage ?? 0);
     setEditIcon(cat.icon || 'ShoppingCart');
   };
 
@@ -92,9 +105,9 @@ export default function BudgetOverview({
     e.preventDefault();
     if (!editingCategory) return;
     if (!editName.trim()) return;
+    if (editPercent === null) return;
 
-    const parsedEdit = parseFloat(editLimit.toString().replace(',', '.'));
-    const percentageNum = parsedEdit ? Math.round(parsedEdit * 100) / 100 : 0;
+    const percentageNum = editPercent;
 
     const updated = categories.map(cat => {
       if (cat.id === editingCategory.id) {
@@ -115,9 +128,9 @@ export default function BudgetOverview({
   const handleAddCategory = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCatName.trim()) return;
+    if (newCatPercent === null) return;
 
-    const parsedNew = parseFloat(newCatLimit.toString().replace(',', '.'));
-    const percentageNum = parsedNew ? Math.round(parsedNew * 100) / 100 : 0;
+    const percentageNum = newCatPercent;
 
     const newCat: Category = {
       id: `cat-${Date.now()}`,
@@ -132,8 +145,35 @@ export default function BudgetOverview({
     
     // Reset form states
     setNewCatName('');
-    setNewCatLimit('');
+    setNewCatPercent(null);
     setShowAddCategory(false);
+  };
+
+  const moveInOrderDraft = (index: number, direction: -1 | 1) => {
+    setOrderDraft(prev => {
+      if (!prev) return prev;
+      const target = index + direction;
+      if (target < 0 || target >= prev.length) return prev;
+      const next = [...prev];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
+
+  const handleSaveOrder = () => {
+    if (!orderDraft) return;
+    const byId = new Map(categories.map(cat => [cat.id, cat]));
+    const reordered = orderDraft
+      .map(id => byId.get(id))
+      .filter((cat): cat is Category => cat !== undefined);
+    // Keep any category that appeared while the modal was open
+    const missing = categories.filter(cat => !orderDraft.includes(cat.id));
+    const next = [...reordered, ...missing];
+    const changed = next.some((cat, index) => cat.id !== categories[index]?.id);
+    if (changed) {
+      onUpdateCategories(next);
+    }
+    setOrderDraft(null);
   };
 
   const handleDeleteCategory = (id: string) => {
@@ -191,31 +231,60 @@ export default function BudgetOverview({
         </div>
       </motion.div>
 
-      {/* 2. Заголовок секции категорий и кнопка добавления */}
-      <div className="flex items-center justify-between px-1">
-        <div className="space-y-1">
-          <h2 className="text-lg font-semibold text-white/90 font-display flex items-center space-x-2">
-            <span>{TRANSLATIONS[language].categorySummaryHeader}</span>
+      {/* 2. Заголовок секции категорий, кнопки добавления и порядка */}
+      <div className="space-y-1.5 px-1">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-white/90 font-display flex items-center space-x-2 min-w-0">
+            <span className="truncate">{TRANSLATIONS[language].categorySummaryHeader}</span>
             <span className="text-xs bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full font-mono font-normal">
               {categories.length}
             </span>
           </h2>
+          <motion.button
+            whileTap={{ scale: 0.95 }}
+            onClick={() => setShowAddCategory(true)}
+            className="flex items-center space-x-1 shrink-0 text-xs font-medium text-indigo-400 hover:text-indigo-300 bg-indigo-500/10 hover:bg-indigo-500/20 px-3 py-1.5 rounded-full border border-indigo-500/20 transition-all duration-200 cursor-pointer"
+          >
+            <Plus size={14} />
+            <span>{TRANSLATIONS[language].addCategoryButton}</span>
+          </motion.button>
+        </div>
+        <div className="flex items-center justify-between">
           <div className="text-[10px] text-slate-400 font-mono">
             {language === 'RU' ? 'Доля распределения:' : 'Allocated share:'}{' '}
-            <span className={`font-semibold ${totalPercentage !== 100 ? 'text-indigo-400' : 'text-emerald-400'}`}>
+            <span className={`font-semibold ${totalPercentage > 100 ? 'text-amber-400' : totalPercentage !== 100 ? 'text-indigo-400' : 'text-emerald-400'}`}>
               {totalPercentage}%
             </span>
+            {totalPercentage > 100 && (
+              <span className="text-amber-400">
+                {language === 'RU' ? ' — больше дохода' : ' — over the income'}
+              </span>
+            )}
           </div>
+          {categories.length > 1 && (
+            <button
+              type="button"
+              onClick={() => setOrderDraft(categories.map(cat => cat.id))}
+              className="flex items-center space-x-1 shrink-0 text-[11px] font-medium text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 px-2.5 py-1 rounded-full border border-white/10 transition-all duration-200 cursor-pointer"
+              title={language === 'RU' ? 'Изменить порядок категорий' : 'Change category order'}
+            >
+              <ArrowUpDown size={12} />
+              <span>{language === 'RU' ? 'Порядок' : 'Order'}</span>
+            </button>
+          )}
         </div>
-        <motion.button
-          whileTap={{ scale: 0.95 }}
-          onClick={() => setShowAddCategory(true)}
-          className="flex items-center space-x-1 text-xs font-medium text-indigo-400 hover:text-indigo-300 bg-indigo-500/10 hover:bg-indigo-500/20 px-3 py-1.5 rounded-full border border-indigo-500/20 transition-all duration-200 cursor-pointer"
-        >
-          <Plus size={14} />
-          <span>{TRANSLATIONS[language].addCategoryButton}</span>
-        </motion.button>
       </div>
+
+      {categories.length > 0 && !hasPrimaryIncomeThisMonth && (
+        <div className="flex items-start space-x-2.5 rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-[11px] leading-snug text-amber-100/90">
+          <Info size={14} className="shrink-0 mt-0.5 text-amber-400" />
+          <span>
+            {language === 'RU'
+              ? 'Основной доход за этот месяц ещё не внесён, поэтому лимиты месяца пока нулевые. Траты идут из остатка с прошлых месяцев.'
+              : 'Primary income for this month has not been entered yet, so the monthly limits are zero. Spending comes out of balances carried over from previous months.'}
+          </span>
+        </div>
+      )}
 
       {/* 3. Список категорий в стиле Deck-карточек */}
       <div className="space-y-4">
@@ -264,8 +333,8 @@ export default function BudgetOverview({
             badgeText = `+${formatMoney(cat.currentAdditional, currencyCode)}`;
           }
 
-          const totalCatLimit = cat.monthlyLimit + cat.currentAdditional;
-          const pct = Math.min(100, (cat.currentExpenses / Math.max(1, totalCatLimit)) * 100);
+          // Share of everything available this month: limit + additional income + carried-over balance
+          const { available, pct } = getCategoryUsage(cat);
 
           return (
             <motion.div
@@ -315,8 +384,13 @@ export default function BudgetOverview({
 
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-xs font-mono">
-                    <span className="text-slate-400">{TRANSLATIONS[language].expensesLabel}: {formatMoney(cat.currentExpenses, currencyCode)}</span>
-                    <span className={`${pct >= 90 ? 'text-rose-400 font-bold' : 'text-slate-400'}`}>{pct.toFixed(0)}%</span>
+                    <span className="text-slate-400 text-[11px]">
+                      {TRANSLATIONS[language].expensesLabel}: {formatMoney(cat.currentExpenses, currencyCode)}{' '}
+                      <span className="text-slate-500 whitespace-nowrap">
+                        {language === 'RU' ? 'из' : 'of'} {formatMoney(Math.max(0, available), currencyCode)}
+                      </span>
+                    </span>
+                    <span className={`shrink-0 pl-2 ${pct >= 90 ? 'text-rose-400 font-bold' : 'text-slate-400'}`}>{pct.toFixed(0)}%</span>
                   </div>
                   <div className="h-2 bg-white/5 rounded-full overflow-hidden">
                     <div 
@@ -378,7 +452,7 @@ export default function BudgetOverview({
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="glass-panel w-full max-w-sm rounded-[32px] p-6 relative z-10 space-y-5 overflow-hidden border border-white/10 shadow-2xl"
+              className="glass-panel w-full max-w-sm rounded-[32px] p-6 relative z-10 space-y-5 max-h-[90vh] overflow-y-auto border border-white/10 shadow-2xl"
             >
               <div className="flex items-center justify-between">
                 <h3 className="font-bold text-white text-base font-display">{TRANSLATIONS[language].editCategoryModalTitle}</h3>
@@ -409,21 +483,18 @@ export default function BudgetOverview({
                   />
                 </div>
 
-                <div className="space-y-1.5">
-                  <label className="text-xs text-slate-400 font-medium whitespace-nowrap truncate block">{TRANSLATIONS[language].monthlyLimitInputLabel}</label>
-                  <input 
-                    type="text"
-                    inputMode="decimal"
-                    required
-                    value={editLimit}
-                    onChange={(e) => setEditLimit(e.target.value)}
-                    className="w-full glass-input rounded-xl px-4 py-2.5 text-sm font-mono"
-                    placeholder="e.g. 30"
-                  />
-                  <p className="text-[10px] text-slate-400 leading-normal">
-                    {language === 'RU' ? 'Укажите процентную долю от всех доходов за месяц.' : 'Enter percentage share from all monthly incomes.'}
-                  </p>
-                </div>
+                <CategoryShareFields
+                  key={editingCategory.id}
+                  incomes={incomes}
+                  currentMonth={currentMonth}
+                  otherPercentTotal={categories
+                    .filter(cat => cat.id !== editingCategory.id)
+                    .reduce((sum, cat) => sum + (cat.percentage ?? 0), 0)}
+                  initialPercent={editingCategory.percentage ?? 0}
+                  onChange={setEditPercent}
+                  currencyCode={currencyCode}
+                  language={language}
+                />
 
                 <div className="space-y-1.5 pt-2">
                   <label className="text-xs text-slate-400 font-medium whitespace-nowrap truncate block">
@@ -445,11 +516,11 @@ export default function BudgetOverview({
 
                 <div className="space-y-1 bg-white/[0.02] border border-white/5 rounded-2xl p-4 text-xs">
                   <div className="text-slate-300 flex justify-between">
-                    <span>{language === 'RU' ? 'Текущий лимит:' : 'Current limit:'}</span>
+                    <span>{language === 'RU' ? 'Лимит этого месяца:' : 'This month\'s limit:'}</span>
                     <span className="font-bold text-white font-mono">{formatMoney(editingCategory.monthlyLimit, currencyCode)}</span>
                   </div>
                   <div className="text-slate-300 flex justify-between mt-1.5">
-                    <span>{language === 'RU' ? 'Прошлый ролловер:' : 'Past rollover:'}</span>
+                    <span>{language === 'RU' ? 'Остаток с прошлого месяца:' : 'Carried over from last month:'}</span>
                     <span className={`font-bold font-mono ${editingCategory.rolloverPreviousMonth < 0 ? 'text-red-400' : 'text-emerald-400'}`}>
                       {editingCategory.rolloverPreviousMonth >= 0 ? '+' : ''}{formatMoney(editingCategory.rolloverPreviousMonth, currencyCode)}
                     </span>
@@ -466,7 +537,8 @@ export default function BudgetOverview({
                   </button>
                   <button
                     type="submit"
-                    className="flex-1 bg-indigo-500 hover:bg-indigo-600 text-white rounded-xl py-2.5 text-xs font-semibold tracking-wider uppercase transition-colors shadow-lg shadow-indigo-500/25 flex items-center justify-center space-x-2 cursor-pointer"
+                    disabled={editPercent === null}
+                    className="flex-1 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:pointer-events-none text-white rounded-xl py-2.5 text-xs font-semibold tracking-wider uppercase transition-colors shadow-lg shadow-indigo-500/25 flex items-center justify-center space-x-2 cursor-pointer"
                   >
                     <Save size={14} />
                     <span>{TRANSLATIONS[language].saveBtn}</span>
@@ -494,7 +566,7 @@ export default function BudgetOverview({
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="glass-panel w-full max-w-sm rounded-[32px] p-6 relative z-10 space-y-4 overflow-hidden border border-white/10 shadow-2xl"
+              className="glass-panel w-full max-w-sm rounded-[32px] p-6 relative z-10 space-y-4 max-h-[90vh] overflow-y-auto border border-white/10 shadow-2xl"
             >
               <div className="flex items-center justify-between">
                 <h3 className="font-bold text-white text-base font-display">{TRANSLATIONS[language].newCategoryModalTitle}</h3>
@@ -519,21 +591,15 @@ export default function BudgetOverview({
                   />
                 </div>
 
-                <div className="space-y-1.5">
-                  <label className="text-xs text-slate-400 font-medium whitespace-nowrap truncate block">{TRANSLATIONS[language].limitInputLabel}</label>
-                  <input 
-                    type="text"
-                    inputMode="decimal"
-                    required
-                    value={newCatLimit}
-                    onChange={(e) => setNewCatLimit(e.target.value)}
-                    className="w-full glass-input rounded-xl px-4 py-2.5 text-sm font-mono"
-                    placeholder="e.g. 25"
-                  />
-                  <p className="text-[10px] text-slate-400 leading-normal">
-                    {language === 'RU' ? 'Процентная доля бюджета (суммарно должно быть около 100%).' : 'Percentage share of the total budget (should sum near 100%).'}
-                  </p>
-                </div>
+                <CategoryShareFields
+                  incomes={incomes}
+                  currentMonth={currentMonth}
+                  otherPercentTotal={categories.reduce((sum, cat) => sum + (cat.percentage ?? 0), 0)}
+                  initialPercent={null}
+                  onChange={setNewCatPercent}
+                  currencyCode={currencyCode}
+                  language={language}
+                />
 
                 <div className="space-y-1.5">
                   <label className="text-xs text-slate-400 font-medium whitespace-nowrap truncate block">{TRANSLATIONS[language].chooseIconLabel}</label>
@@ -554,13 +620,108 @@ export default function BudgetOverview({
                 <div className="pt-2">
                   <button
                     type="submit"
-                    className="w-full bg-indigo-500 hover:bg-indigo-600 text-white rounded-xl py-2.5 text-xs font-semibold tracking-wider uppercase transition-colors shadow-lg shadow-indigo-500/25 flex items-center justify-center space-x-2 cursor-pointer"
+                    disabled={newCatPercent === null}
+                    className="w-full bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:pointer-events-none text-white rounded-xl py-2.5 text-xs font-semibold tracking-wider uppercase transition-colors shadow-lg shadow-indigo-500/25 flex items-center justify-center space-x-2 cursor-pointer"
                   >
                     <Plus size={14} />
                     <span>{TRANSLATIONS[language].addCategorySubmitBtn}</span>
                   </button>
                 </div>
               </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Modal - Category order */}
+      <AnimatePresence>
+        {orderDraft && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setOrderDraft(null)}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            />
+
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="glass-panel w-full max-w-sm rounded-[32px] p-6 relative z-10 space-y-4 max-h-[90vh] flex flex-col border border-white/10 shadow-2xl"
+            >
+              <div className="flex items-center justify-between">
+                <h3 className="font-bold text-white text-base font-display">
+                  {language === 'RU' ? 'Порядок категорий' : 'Category order'}
+                </h3>
+                <button 
+                  onClick={() => setOrderDraft(null)}
+                  className="p-1.5 hover:bg-white/10 rounded-full transition duration-150 text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              <p className="text-[11px] text-slate-400 leading-snug">
+                {language === 'RU'
+                  ? 'Стрелками поставьте категории в нужном порядке. В таком же порядке они будут в обзоре, в списках выбора и в Google Таблице.'
+                  : 'Use the arrows to put the categories in the order you want. The overview, the pickers and the Google Sheet will follow it.'}
+              </p>
+
+              <div className="space-y-2 overflow-y-auto min-h-0 pr-1">
+                {orderDraft.map((id, index) => {
+                  const cat = categories.find(c => c.id === id);
+                  if (!cat) return null;
+                  return (
+                    <motion.div
+                      layout
+                      transition={{ duration: 0.15 }}
+                      key={id}
+                      className="flex items-center justify-between rounded-2xl border border-white/5 bg-slate-900/60 pl-3 pr-2 py-2"
+                    >
+                      <div className="flex items-center space-x-2.5 min-w-0">
+                        <span className="text-[10px] font-mono text-slate-500 w-4 text-right shrink-0">{index + 1}</span>
+                        <div className="p-2 rounded-xl bg-slate-800/80 text-indigo-400 shrink-0">
+                          <CategoryIcon name={cat.icon} size={14} />
+                        </div>
+                        <span className="text-sm font-semibold text-white truncate">
+                          {getLocalizedCategoryName(cat.name, language)}
+                        </span>
+                      </div>
+                      <div className="flex items-center space-x-1 shrink-0">
+                        <button
+                          type="button"
+                          disabled={index === 0}
+                          onClick={() => moveInOrderDraft(index, -1)}
+                          className="p-2.5 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition cursor-pointer disabled:opacity-20 disabled:pointer-events-none"
+                          aria-label={language === 'RU' ? `Поднять «${cat.name}» выше` : `Move ${cat.name} up`}
+                        >
+                          <ChevronUp size={16} />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={index === orderDraft.length - 1}
+                          onClick={() => moveInOrderDraft(index, 1)}
+                          className="p-2.5 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition cursor-pointer disabled:opacity-20 disabled:pointer-events-none"
+                          aria-label={language === 'RU' ? `Опустить «${cat.name}» ниже` : `Move ${cat.name} down`}
+                        >
+                          <ChevronDown size={16} />
+                        </button>
+                      </div>
+                    </motion.div>
+                  );
+                })}
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSaveOrder}
+                className="w-full bg-indigo-500 hover:bg-indigo-600 text-white rounded-xl py-2.5 text-xs font-semibold tracking-wider uppercase transition-colors shadow-lg shadow-indigo-500/25 flex items-center justify-center space-x-2 cursor-pointer shrink-0"
+              >
+                <Save size={14} />
+                <span>{TRANSLATIONS[language].saveBtn}</span>
+              </button>
             </motion.div>
           </div>
         )}
