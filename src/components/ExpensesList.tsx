@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Category, Expense } from '../types';
-import { formatMoney, groupExpensesByMonth, getCurrencySymbol } from '../utils/finance';
+import { formatMoney, groupExpensesByMonth, getCurrencySymbol, todayLocalISO, currentLocalMonth } from '../utils/finance';
 import CategoryIcon from './CategoryIcon';
 import { Plus, X, Calendar, Coins, Tag, CalendarClock, ChevronDown, ChevronRight, Trash2, Search, Pencil } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -9,6 +9,8 @@ import { LanguageCode, TRANSLATIONS, getLocalizedCategoryName, getReadableMonthL
 interface ExpensesListProps {
   categories: Category[];
   expenses: Expense[];
+  /** Month selected in the header (YYYY-MM) */
+  currentMonth?: string;
   onAddExpense: (expense: Expense) => void;
   onDeleteExpense: (id: string) => void;
   onEditExpense: (expense: Expense) => void;
@@ -19,6 +21,7 @@ interface ExpensesListProps {
 export default function ExpensesList({
   categories,
   expenses,
+  currentMonth,
   onAddExpense,
   onDeleteExpense,
   onEditExpense,
@@ -26,13 +29,28 @@ export default function ExpensesList({
   language = 'RU'
 }: ExpensesListProps) {
   const [showAddModal, setShowAddModal] = useState(false);
-  const [collapsedMonths, setCollapsedMonths] = useState<Record<string, boolean>>({});
+  // Months the user opened or closed by hand: true = open, false = closed
+  const [monthToggles, setMonthToggles] = useState<Record<string, boolean>>({});
   const [searchQuery, setSearchQuery] = useState('');
+  const isSearching = searchQuery.trim() !== '';
+
+  // While searching every month with matches is open; leaving the search restores the default view
+  useEffect(() => {
+    setMonthToggles({});
+  }, [isSearching]);
+
+  // By default only the current month is open (plus the month selected in the header, if it is another one)
+  const todayMonth = currentLocalMonth();
+  const isMonthOpen = (monthKey: string) => {
+    const toggled = monthToggles[monthKey];
+    if (toggled !== undefined) return toggled;
+    return isSearching || monthKey === todayMonth || monthKey === currentMonth;
+  };
 
   // Form states
   const [amount, setAmount] = useState('');
   const [categoryId, setCategoryId] = useState('');
-  const [date, setDate] = useState(new Date().toISOString().split('T')[0]); // Default to today's date
+  const [date, setDate] = useState(todayLocalISO()); // Default to today's date
   const [description, setDescription] = useState('');
 
   // Edit Expense states
@@ -82,9 +100,10 @@ export default function ExpensesList({
   const monthKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a)); // Sort in descending order
 
   const toggleMonth = (monthKey: string) => {
-    setCollapsedMonths(prev => ({
+    const nextOpen = !isMonthOpen(monthKey);
+    setMonthToggles(prev => ({
       ...prev,
-      [monthKey]: !prev[monthKey]
+      [monthKey]: nextOpen
     }));
   };
 
@@ -114,7 +133,7 @@ export default function ExpensesList({
     // Reset fields
     setAmount('');
     setCategoryId('');
-    setDate(new Date().toISOString().split('T')[0]);
+    setDate(todayLocalISO());
     setDescription('');
     setShowAddModal(false);
   };
@@ -212,7 +231,7 @@ export default function ExpensesList({
         <div className="space-y-4">
           {monthKeys.map(monthKey => {
             const monthExpenses = groups[monthKey];
-            const isCollapsed = !!collapsedMonths[monthKey];
+            const isCollapsed = !isMonthOpen(monthKey);
             const totalMonthlyAmount = monthExpenses.reduce((sum, e) => sum + e.amount, 0);
 
             return (
@@ -223,6 +242,7 @@ export default function ExpensesList({
                 {/* 1. Monthly Group Header Row (Interactive Toggle) */}
                 <button
                   onClick={() => toggleMonth(monthKey)}
+                  aria-expanded={!isCollapsed}
                   className="w-full flex items-center justify-between p-4 bg-slate-900/40 hover:bg-slate-900/60 transition-all text-left border-b border-white/5 select-none focus:outline-none cursor-pointer"
                 >
                   <div className="flex items-center space-x-2">

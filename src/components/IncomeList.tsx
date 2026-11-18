@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Category, AdditionalIncome } from '../types';
-import { formatMoney, getCurrencySymbol } from '../utils/finance';
+import { formatMoney, getCurrencySymbol, todayLocalISO } from '../utils/finance';
 import CategoryIcon from './CategoryIcon';
 import { Plus, Trash2, Calendar, Coins, ListFilter, Sparkles, Check, Info } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -29,7 +29,7 @@ export default function IncomeList({
   // Form states
   const [amount, setAmount] = useState('');
   const [description, setDescription] = useState('');
-  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+  const [date, setDate] = useState(todayLocalISO());
   const [selectedCategoryIds, setSelectedCategoryIds] = useState<string[]>([]);
 
   const parsedValue = parseFloat(amount.toString().replace(',', '.'));
@@ -81,7 +81,7 @@ export default function IncomeList({
     // Reset Form
     setAmount('');
     setDescription('');
-    setDate(new Date().toISOString().split('T')[0]);
+    setDate(todayLocalISO());
     setSelectedCategoryIds([]);
   };
 

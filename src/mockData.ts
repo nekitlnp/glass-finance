@@ -1,14 +1,17 @@
-import { Category, Expense, AdditionalIncome } from './types';
+import { Category, Expense, AdditionalIncome, CashbackEntry } from './types';
+import { currentLocalMonth } from './utils/finance';
 
 export const INITIAL_CATEGORIES: Category[] = [];
 export const INITIAL_EXPENSES: Expense[] = [];
 export const INITIAL_INCOMES: AdditionalIncome[] = [];
+export const INITIAL_CASHBACK: CashbackEntry[] = [];
 
 export const STORAGE_KEYS = {
   CATEGORIES: 'glass_finance_categories_v3',
   EXPENSES: 'glass_finance_expenses_v3',
   INCOMES: 'glass_finance_incomes_v3',
-  CURRENT_MONTH: 'glass_finance_current_month_v3'
+  CURRENT_MONTH: 'glass_finance_current_month_v3',
+  CASHBACK: 'glass_finance_cashback_v1'
 };
 
 export function loadState() {
@@ -17,22 +20,25 @@ export function loadState() {
     const expensesStr = localStorage.getItem(STORAGE_KEYS.EXPENSES);
     const incomesStr = localStorage.getItem(STORAGE_KEYS.INCOMES);
     const currentMonthStr = localStorage.getItem(STORAGE_KEYS.CURRENT_MONTH);
+    const cashbackStr = localStorage.getItem(STORAGE_KEYS.CASHBACK);
 
-    const defaultMonth = new Date().toISOString().substring(0, 7);
+    const defaultMonth = currentLocalMonth();
 
     return {
       categories: categoriesStr ? JSON.parse(categoriesStr) : INITIAL_CATEGORIES,
       expenses: expensesStr ? JSON.parse(expensesStr) : INITIAL_EXPENSES,
       incomes: incomesStr ? JSON.parse(incomesStr) : INITIAL_INCOMES,
+      cashback: cashbackStr ? JSON.parse(cashbackStr) : INITIAL_CASHBACK,
       currentMonth: currentMonthStr || defaultMonth
     };
   } catch (e) {
     console.error('Failed to read from localStorage:', e);
-    const defaultMonth = new Date().toISOString().substring(0, 7);
+    const defaultMonth = currentLocalMonth();
     return {
       categories: INITIAL_CATEGORIES,
       expenses: INITIAL_EXPENSES,
       incomes: INITIAL_INCOMES,
+      cashback: INITIAL_CASHBACK,
       currentMonth: defaultMonth
     };
   }
@@ -42,6 +48,7 @@ export function saveState(state: {
   categories: Category[];
   expenses: Expense[];
   incomes: AdditionalIncome[];
+  cashback: CashbackEntry[];
   currentMonth: string;
 }) {
   try {
@@ -49,6 +56,7 @@ export function saveState(state: {
     localStorage.setItem(STORAGE_KEYS.EXPENSES, JSON.stringify(state.expenses));
     localStorage.setItem(STORAGE_KEYS.INCOMES, JSON.stringify(state.incomes));
     localStorage.setItem(STORAGE_KEYS.CURRENT_MONTH, state.currentMonth);
+    localStorage.setItem(STORAGE_KEYS.CASHBACK, JSON.stringify(state.cashback));
   } catch (e) {
     console.error('Failed to write to localStorage:', e);
   }

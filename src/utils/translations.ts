@@ -5,6 +5,7 @@ export interface TranslationKeys {
   selectPeriodChevron: string;
   navOverview: string;
   navExpenses: string;
+  navCashback: string;
   navIncome: string;
 
   // Alerts & Notifications
@@ -138,10 +139,11 @@ export const TRANSLATIONS: Record<LanguageCode, TranslationKeys> = {
     selectPeriodChevron: 'выбрать период ▾',
     navOverview: 'Обзор',
     navExpenses: 'Расходы',
+    navCashback: 'Кэшбэк',
     navIncome: 'Доходы',
     limitExceededTitle: 'Лимит превышен!',
     limitExceededDesc: (desc, amount, remaining, category) =>
-      `Расход "${desc}" на сумму ${amount} превышает доступный «Остаток_Всего» (${remaining}) по категории "${category}".`,
+      `Расход "${desc}" на сумму ${amount} превышает доступный остаток (${remaining}) по категории "${category}".`,
     confirmDeleteExpense: 'Вы уверены, что хотите удалить этот расход?',
     confirmDeleteIncome:
       'Вы уверены, что хотите удалить этот доход? Связанные вливания в категории автоматически пересчитаются.',
@@ -175,8 +177,8 @@ export const TRANSLATIONS: Record<LanguageCode, TranslationKeys> = {
     editCategoryModalTitle: 'Редактировать бюджет',
     monthlyLimitLabel: 'Месячный лимит',
     monthlyLimitInputLabel: 'Доля (%)',
-    rolloverLabel: 'Ролловер с прошлого месяца',
-    rolloverInputLabel: 'Ролловер с прошлого месяца',
+    rolloverLabel: 'Остаток с прошлого месяца',
+    rolloverInputLabel: 'Остаток с прошлого месяца',
     rolloverInputHelp: 'Сумма остатка с прошлого месяца. Может быть положительной (профицит) или отрицательной (перерасход).',
     rolloverDesc:
       'Сумма остатка, неиспользованная ранее. Может быть положительной (профицит) или отрицательной (долг/перерасход).',
@@ -187,12 +189,12 @@ export const TRANSLATIONS: Record<LanguageCode, TranslationKeys> = {
     categoryNameInputLabel: 'Название категории',
     categoryNameInputPlaceholder: 'Например, Продукты, Такси...',
     limitInputLabel: 'Доля (%)',
-    pastRolloverInputLabel: 'Ролловер прошлой даты',
+    pastRolloverInputLabel: 'Остаток с прошлого месяца',
     chooseIconLabel: 'Выберите иконку категории',
     addCategorySubmitBtn: 'ДОБАВИТЬ',
     confirmDeleteCategory:
       'Вы уверены, что хотите удалить эту категорию? Связанные расходы все еще будут отображаться в списке расходов, но пропадут из расчетов по категориям.',
-    rolloverNegativeWarning: 'Внимание: отрицательный ролловер уменьшает общий бюджет категории!',
+    rolloverNegativeWarning: 'Внимание: перерасход прошлого месяца уменьшает бюджет категории в этом месяце!',
     noDescription: 'Без описания',
     noCategory: 'Без категории',
     noCategoryAlternative: 'Удаленная категория',
@@ -268,6 +270,7 @@ export const TRANSLATIONS: Record<LanguageCode, TranslationKeys> = {
     selectPeriodChevron: 'select period ▾',
     navOverview: 'Overview',
     navExpenses: 'Expenses',
+    navCashback: 'Cashback',
     navIncome: 'Incomes',
     limitExceededTitle: 'Limit Exceeded!',
     limitExceededDesc: (desc, amount, remaining, category) =>
