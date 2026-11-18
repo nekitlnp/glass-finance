@@ -1,18 +1,20 @@
 {
+  "id": "./",
   "name": "Glass Finance",
   "short_name": "Glass Finance",
   "description": "Liquid Glass Budget Planner",
-  "start_url": "/",
+  "start_url": "./",
+  "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#090d16",
   "theme_color": "#090d16",
-  "scope": "/",
   "icons": [
     {
-      "src": "/apple-touch-icon.png",
+      "src": "./apple-touch-icon.png",
       "sizes": "512x512",
-      "type": "image/png"
+      "type": "image/png",
+      "purpose": "any"
     }
   ]
 }
