@@ -49,6 +49,35 @@ const SYNC_DIRTY_KEY = 'glass_finance_sync_dirty';
 const LAST_SYNC_KEY = 'glass_finance_last_sync_at';
 // What is known about the connected sheet and cashback: { url, supported, synced }
 const SHEET_CASHBACK_KEY = 'glass_finance_sheet_cashback';
+// Calendar month (YYYY-MM) when the app was last open: tells that a new month has begun since then
+const MONTH_SEEN_KEY = 'glass_finance_month_seen';
+
+function readMonthSeen(): string | null {
+  try {
+    return localStorage.getItem(MONTH_SEEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeMonthSeen(month: string) {
+  try {
+    localStorage.setItem(MONTH_SEEN_KEY, month);
+  } catch (e) {
+    console.error('Failed to write the seen month to localStorage:', e);
+  }
+}
+
+/**
+ * Month to open the app on: the current calendar month if a new month has begun since the app
+ * was last open, otherwise the month the user was looking at.
+ */
+function initialMonth(): string {
+  const today = currentLocalMonth();
+  const stored = loadState().currentMonth;
+  if (readMonthSeen() !== today) return today;
+  return stored > today ? today : stored;
+}
 
 interface SheetData {
   categories: Category[];
@@ -187,7 +216,7 @@ export default function App() {
   const [expenses, setExpenses] = useState<Expense[]>(() => loadState().expenses);
   const [incomes, setIncomes] = useState<AdditionalIncome[]>(() => loadState().incomes);
   const [cashback, setCashback] = useState<CashbackEntry[]>(() => loadState().cashback);
-  const [currentMonth, setCurrentMonth] = useState(() => loadState().currentMonth);
+  const [currentMonth, setCurrentMonth] = useState(initialMonth);
   
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
@@ -566,6 +595,30 @@ export default function App() {
       clearInterval(timer);
     };
   }, [isSyncConfigured]);
+
+  // A new month begins while the app stays open or sits in the background (a home screen app
+  // on iPhone can stay suspended for days): switch to it when the app is opened again
+  useEffect(() => {
+    writeMonthSeen(currentLocalMonth());
+    const checkMonth = () => {
+      const today = currentLocalMonth();
+      if (readMonthSeen() !== today) {
+        writeMonthSeen(today);
+        setCurrentMonth(today);
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') checkMonth();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', checkMonth);
+    const timer = setInterval(checkMonth, 60000);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('focus', checkMonth);
+      clearInterval(timer);
+    };
+  }, []);
 
   // Every screen opens from the top
   useEffect(() => {
