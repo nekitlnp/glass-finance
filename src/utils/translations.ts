@@ -5,6 +5,7 @@ export interface TranslationKeys {
   selectPeriodChevron: string;
   navOverview: string;
   navExpenses: string;
+  navCashback: string;
   navIncome: string;
 
   // Alerts & Notifications
@@ -138,6 +139,7 @@ export const TRANSLATIONS: Record<LanguageCode, TranslationKeys> = {
     selectPeriodChevron: 'выбрать период ▾',
     navOverview: 'Обзор',
     navExpenses: 'Расходы',
+    navCashback: 'Кэшбэк',
     navIncome: 'Доходы',
     limitExceededTitle: 'Лимит превышен!',
     limitExceededDesc: (desc, amount, remaining, category) =>
@@ -268,6 +270,7 @@ export const TRANSLATIONS: Record<LanguageCode, TranslationKeys> = {
     selectPeriodChevron: 'select period ▾',
     navOverview: 'Overview',
     navExpenses: 'Expenses',
+    navCashback: 'Cashback',
     navIncome: 'Incomes',
     limitExceededTitle: 'Limit Exceeded!',
     limitExceededDesc: (desc, amount, remaining, category) =>

@@ -14,7 +14,14 @@
  *    - У кого есть доступ: "Все" (Anyone) - это важно для беспрепятственного POST/GET!
  * 8. Нажмите "Развернуть" (Deploy). Google попросит авторизовать доступ, разрешите его.
  * 9. Скопируйте полученный URL веб-приложения (это SCRIPT_URL) и вставьте его во фронтенд в `src/App.tsx`.
+ *
+ * ОБНОВЛЕНИЕ СКРИПТА (например, чтобы появился лист «Кэшбэк»):
+ * замените весь код новым, сохраните, затем «Начать развертывание» -> «Управление развертываниями» ->
+ * карандаш -> Версия: «Новая версия» -> «Развернуть». Ссылка останется прежней.
  */
+
+var CASHBACK_HEADERS = ["ID", "Банк", "Категория", "Процент кэшбэка", "Месяц", "Комментарий"];
+var EVERY_MONTH = "каждый месяц";
 
 // Авто-инициализация структуры таблиц
 function initSheets() {
@@ -50,6 +57,16 @@ function initSheets() {
     addIncomesSheet = ss.insertSheet("ДопДоходы");
     addIncomesSheet.appendRow(["ID", "Дата", "Источник", "Сумма", "Куда распределено"]);
     addIncomesSheet.getRange(1, 1, 1, 5).setFontWeight("bold").setBackground("#f3f4f6");
+  }
+
+  // 5. Лист "Кэшбэк"
+  var cashbackSheet = ss.getSheetByName("Кэшбэк");
+  if (!cashbackSheet) {
+    cashbackSheet = ss.insertSheet("Кэшбэк");
+    cashbackSheet.appendRow(CASHBACK_HEADERS);
+    cashbackSheet.getRange(1, 1, 1, CASHBACK_HEADERS.length).setFontWeight("bold").setBackground("#f3f4f6");
+    // Месяц хранится текстом «2026-11», иначе таблица превратит его в дату
+    cashbackSheet.getRange("E:E").setNumberFormat("@");
   }
 
   // Удаляем стандартный "Лист1", если он пустой и есть другие листы
@@ -136,6 +153,17 @@ function formatDate(dateVal) {
   return String(dateVal);
 }
 
+// Месяц кэшбэка: «2026-11», пусто для «каждый месяц». Дату, введённую вручную, приводим к «ГГГГ-ММ».
+function formatCashbackMonth(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (value instanceof Date) {
+    return Utilities.formatDate(value, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "yyyy-MM");
+  }
+  var text = String(value).trim();
+  if (text.toLowerCase() === EVERY_MONTH || text.toLowerCase() === "постоянно") return "";
+  return text.substring(0, 7);
+}
+
 // GET-запрос: загрузка данных и автоинициализация
 function doGet(e) {
   try {
@@ -146,6 +174,7 @@ function doGet(e) {
     var expensesSheet = ss.getSheetByName("Расходы");
     var incomesSheet = ss.getSheetByName("Доходы");
     var addIncomesSheet = ss.getSheetByName("ДопДоходы");
+    var cashbackSheet = ss.getSheetByName("Кэшбэк");
     
     var rawCategories = readSheetData(categoriesSheet);
     var rawExpenses = readSheetData(expensesSheet);
@@ -219,11 +248,25 @@ function doGet(e) {
       });
     });
     
+    var cashback = readSheetData(cashbackSheet).map(function(c) {
+      return {
+        id: cleanStr(c["ID"], ""),
+        bank: cleanStr(c["Банк"], ""),
+        category: cleanStr(c["Категория"], ""),
+        percent: Number(String(c["Процент кэшбэка"]).replace(",", ".")) || 0,
+        month: formatCashbackMonth(c["Месяц"]),
+        note: cleanStr(c["Комментарий"], "")
+      };
+    }).filter(function(c) {
+      return c.bank !== "" && c.category !== "";
+    });
+    
     var response = {
       status: "success",
       categories: categories,
       expenses: expenses,
-      incomes: incomes
+      incomes: incomes,
+      cashback: cashback
     };
     
     return ContentService.createTextOutput(JSON.stringify(response))
@@ -248,6 +291,8 @@ function doPost(e) {
     var expensesSheet = ss.getSheetByName("Расходы");
     var incomesSheet = ss.getSheetByName("Доходы");
     var addIncomesSheet = ss.getSheetByName("ДопДоходы");
+    var cashbackSheet = ss.getSheetByName("Кэшбэк");
+    var cashbackSaved = false;
     
     if (postData.categories) {
       var categoriesToSave = postData.categories.map(function(c) {
@@ -321,9 +366,32 @@ function doPost(e) {
       );
     }
     
+    if (postData.cashback) {
+      var cashbackToSave = postData.cashback.map(function(c) {
+        c.sheetMonth = c.month ? String(c.month) : EVERY_MONTH;
+        return c;
+      });
+      cashbackSheet.getRange("E:E").setNumberFormat("@");
+      writeSheetData(
+        cashbackSheet,
+        CASHBACK_HEADERS,
+        cashbackToSave,
+        {
+          "ID": "id",
+          "Банк": "bank",
+          "Категория": "category",
+          "Процент кэшбэка": "percent",
+          "Месяц": "sheetMonth",
+          "Комментарий": "note"
+        }
+      );
+      cashbackSaved = true;
+    }
+    
     return ContentService.createTextOutput(JSON.stringify({
       status: "success",
-      message: "Данные успешно синхронизированы"
+      message: "Данные успешно синхронизированы",
+      cashbackSaved: cashbackSaved
     })).setMimeType(ContentService.MimeType.JSON);
   } catch (error) {
     return ContentService.createTextOutput(JSON.stringify({

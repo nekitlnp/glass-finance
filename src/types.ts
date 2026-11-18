@@ -24,6 +24,21 @@ export interface AdditionalIncome {
   type?: 'primary' | 'additional';
 }
 
+/**
+ * One cashback category chosen in a bank.
+ * Bank and category are stored by name, so rows typed into the sheet by hand still work.
+ */
+export interface CashbackEntry {
+  id: string;
+  bank: string;
+  category: string;
+  percent: number;
+  /** Month the category is chosen for (YYYY-MM); empty string = every month */
+  month: string;
+  /** Card, limit or conditions, as the user wrote them */
+  note?: string;
+}
+
 // Calculated virtual fields for UI
 export interface CategoryWithCalculations extends Category {
   currentExpenses: number;

@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Category, Expense, AdditionalIncome } from './types';
+import { Category, Expense, AdditionalIncome, CashbackEntry } from './types';
 import { loadState, saveState, INITIAL_CATEGORIES } from './mockData';
 import BudgetOverview from './components/BudgetOverview';
 import ExpensesList from './components/ExpensesList';
 import IncomeList from './components/IncomeList';
+import CashbackTab, { CashbackStorage } from './components/CashbackTab';
 import { ImportModal } from './components/ImportModal';
 import { OnboardingGuide } from './components/OnboardingGuide';
 import { 
@@ -27,7 +28,8 @@ import {
   RefreshCw,
   Upload,
   BookOpen,
-  CloudOff
+  CloudOff,
+  BadgePercent
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { formatMoney, calculateCategoriesForMonth, getCurrencySymbol, currentLocalMonth } from './utils/finance';
@@ -45,11 +47,23 @@ type ThemeMode = 'dark' | 'light' | 'system';
 // ------------ GOOGLE SHEETS TRANSPORT ------------
 const SYNC_DIRTY_KEY = 'glass_finance_sync_dirty';
 const LAST_SYNC_KEY = 'glass_finance_last_sync_at';
+// What is known about the connected sheet and cashback: { url, supported, synced }
+const SHEET_CASHBACK_KEY = 'glass_finance_sheet_cashback';
 
 interface SheetData {
   categories: Category[];
   expenses: Expense[];
   incomes: AdditionalIncome[];
+  /** Missing when the sheet's script is an older version without the cashback list */
+  cashback?: CashbackEntry[];
+}
+
+interface SheetCashbackState {
+  url: string;
+  /** The script stores cashback; null while unknown */
+  supported: boolean | null;
+  /** The sheet's cashback list has been in sync with this device at least once */
+  synced: boolean;
 }
 
 /** The script answered, and the answer was "error": the sheet did not accept the data. */
@@ -92,7 +106,24 @@ function normalizeSheetResponse(res: any): { data: SheetData; generatedIds: bool
     description: (!i.description || i.description === 'undefined') ? '' : String(i.description),
   }));
 
-  return { data: { categories, expenses, incomes }, generatedIds };
+  // An older script does not send the cashback list at all: that is not the same as an empty list
+  const cashback: CashbackEntry[] | undefined = Array.isArray(res.cashback)
+    ? res.cashback
+        .map((c: any) => {
+          const entry: CashbackEntry = {
+            id: (!c.id || c.id === 'undefined') ? makeId('cb') : String(c.id),
+            bank: (!c.bank || c.bank === 'undefined') ? '' : String(c.bank).trim(),
+            category: (!c.category || c.category === 'undefined') ? '' : String(c.category).trim(),
+            percent: Number(String(c.percent).replace(',', '.')) || 0,
+            month: (!c.month || c.month === 'undefined') ? '' : String(c.month).trim()
+          };
+          if (c.note && c.note !== 'undefined') entry.note = String(c.note);
+          return entry;
+        })
+        .filter((c: CashbackEntry) => c.bank !== '' && c.category !== '')
+    : undefined;
+
+  return { data: { categories, expenses, incomes, cashback }, generatedIds };
 }
 
 async function readSheet(url: string): Promise<{ data: SheetData; generatedIds: boolean }> {
@@ -113,8 +144,9 @@ const totalInCents = (items: { amount: number }[]) =>
 /**
  * Saves everything to the sheet and resolves only when the save is confirmed.
  * Throws when the sheet could not be reached or did not accept the data.
+ * `cashbackSaved` says whether the sheet's script stored cashback (an older script ignores it).
  */
-async function writeSheet(url: string, payload: SheetData): Promise<void> {
+async function writeSheet(url: string, payload: SheetData): Promise<{ cashbackSaved: boolean }> {
   const body = JSON.stringify(payload);
   const headers = { 'Content-Type': 'text/plain;charset=utf-8' };
 
@@ -123,7 +155,7 @@ async function writeSheet(url: string, payload: SheetData): Promise<void> {
     const response = await fetch(url, { method: 'POST', headers, body });
     if (response.ok) {
       const res = JSON.parse(await response.text());
-      if (res && res.status === 'success') return;
+      if (res && res.status === 'success') return { cashbackSaved: res.cashbackSaved === true };
       if (res && res.status === 'error') {
         throw new SheetRejectedError(res.message || 'Sheet error');
       }
@@ -141,10 +173,12 @@ async function writeSheet(url: string, payload: SheetData): Promise<void> {
     data.expenses.length === payload.expenses.length &&
     data.incomes.length === payload.incomes.length &&
     totalInCents(data.expenses) === totalInCents(payload.expenses) &&
-    totalInCents(data.incomes) === totalInCents(payload.incomes);
+    totalInCents(data.incomes) === totalInCents(payload.incomes) &&
+    (data.cashback === undefined || data.cashback.length === (payload.cashback || []).length);
   if (!confirmed) {
     throw new Error('SHEET_MISMATCH');
   }
+  return { cashbackSaved: data.cashback !== undefined };
 }
 
 export default function App() {
@@ -152,6 +186,7 @@ export default function App() {
   const [categories, setCategories] = useState<Category[]>(() => loadState().categories);
   const [expenses, setExpenses] = useState<Expense[]>(() => loadState().expenses);
   const [incomes, setIncomes] = useState<AdditionalIncome[]>(() => loadState().incomes);
+  const [cashback, setCashback] = useState<CashbackEntry[]>(() => loadState().cashback);
   const [currentMonth, setCurrentMonth] = useState(() => loadState().currentMonth);
   
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -234,8 +269,35 @@ export default function App() {
   const [saveRequest, setSaveRequest] = useState(0);
 
   // Latest values for async code, which would otherwise see a stale render
-  const dataRef = useRef<SheetData>({ categories, expenses, incomes });
-  dataRef.current = { categories, expenses, incomes };
+  const dataRef = useRef<SheetData>({ categories, expenses, incomes, cashback });
+  dataRef.current = { categories, expenses, incomes, cashback };
+
+  // What the connected sheet does with cashback (kept per sheet link)
+  const [sheetCashback, setSheetCashbackState] = useState<SheetCashbackState>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(SHEET_CASHBACK_KEY) || 'null');
+      if (stored && typeof stored.url === 'string') return stored;
+    } catch {
+      // ignore broken value
+    }
+    return { url: '', supported: null, synced: false };
+  });
+  const sheetCashbackRef = useRef(sheetCashback);
+  const updateSheetCashback = (url: string, patch: Partial<Omit<SheetCashbackState, 'url'>>) => {
+    const base = sheetCashbackRef.current.url === url
+      ? sheetCashbackRef.current
+      : { url, supported: null, synced: false };
+    const next = { ...base, ...patch, url };
+    sheetCashbackRef.current = next;
+    setSheetCashbackState(next);
+    try {
+      localStorage.setItem(SHEET_CASHBACK_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.error('Failed to write sheet cashback state to localStorage:', e);
+    }
+  };
+  const cashbackSyncedWith = (url: string) =>
+    sheetCashbackRef.current.url === url && sheetCashbackRef.current.synced;
   const scriptUrlRef = useRef(scriptUrl);
   scriptUrlRef.current = scriptUrl;
   const revisionRef = useRef(0); // grows with every local change
@@ -303,8 +365,14 @@ export default function App() {
     try {
       const { data, generatedIds } = await readSheet(activeUrl);
       const local = dataRef.current;
-      const sheetIsEmpty = data.categories.length === 0 && data.expenses.length === 0 && data.incomes.length === 0;
-      const deviceHasData = local.categories.length > 0 || local.expenses.length > 0 || local.incomes.length > 0;
+      const localCashback = local.cashback || [];
+      const sheetCashbackList = data.cashback;
+      const sheetIsEmpty =
+        data.categories.length === 0 && data.expenses.length === 0 && data.incomes.length === 0 &&
+        (sheetCashbackList === undefined || sheetCashbackList.length === 0);
+      const deviceHasData =
+        local.categories.length > 0 || local.expenses.length > 0 || local.incomes.length > 0 || localCashback.length > 0;
+      updateSheetCashback(activeUrl, { supported: sheetCashbackList !== undefined });
 
       if (dirtyRef.current || revisionRef.current !== revisionAtStart) {
         // Something was changed on the device while the sheet was loading: the device copy is newer
@@ -325,6 +393,15 @@ export default function App() {
         setCategories(data.categories);
         setExpenses(data.expenses);
         setIncomes(data.incomes);
+        if (sheetCashbackList !== undefined) {
+          if (sheetCashbackList.length === 0 && localCashback.length > 0 && !cashbackSyncedWith(activeUrl)) {
+            // The script was just updated and its cashback list is still empty: fill it from this device
+            requestSave();
+          } else {
+            setCashback(sheetCashbackList);
+            updateSheetCashback(activeUrl, { synced: true });
+          }
+        }
         markSynced();
         if (generatedIds) {
           // Rows typed into the sheet by hand got ids just now: store them in the sheet
@@ -370,8 +447,9 @@ export default function App() {
     const revision = revisionRef.current;
     let confirmed = false;
     try {
-      await writeSheet(url, dataRef.current);
+      const { cashbackSaved } = await writeSheet(url, dataRef.current);
       confirmed = true;
+      updateSheetCashback(url, cashbackSaved ? { supported: true, synced: true } : { supported: false });
       setSyncError(null);
       markSynced();
       if (revisionRef.current === revision) {
@@ -535,8 +613,8 @@ export default function App() {
 
   // 3. Save State to LocalStorage
   useEffect(() => {
-    saveState({ categories, expenses, incomes, currentMonth });
-  }, [categories, expenses, incomes, currentMonth]);
+    saveState({ categories, expenses, incomes, cashback, currentMonth });
+  }, [categories, expenses, incomes, cashback, currentMonth]);
 
   // 4. Send changes to Google Sheets shortly after the last edit
   useEffect(() => {
@@ -570,6 +648,17 @@ export default function App() {
     setCategories(updatedCats);
     markUserModified();
   };
+
+  const handleUpdateCashback = (updated: CashbackEntry[]) => {
+    setCashback(updated);
+    markUserModified();
+  };
+
+  const cashbackStorage: CashbackStorage = !isSyncConfigured
+    ? 'device'
+    : sheetCashback.url === scriptUrl && sheetCashback.supported === false
+      ? 'device-only'
+      : 'sheet';
 
   const handleAddExpense = (newExpense: Expense) => {
     const expenseMonth = newExpense.date.substring(0, 7);
@@ -915,6 +1004,16 @@ export default function App() {
                 />
               )}
 
+              {activeTab === 3 && (
+                <CashbackTab
+                  entries={cashback}
+                  currentMonth={currentMonth}
+                  onChange={handleUpdateCashback}
+                  storage={cashbackStorage}
+                  language={language}
+                />
+              )}
+
               {activeTab === 1 && (
                 <ExpensesList
                   categories={categories}
@@ -980,6 +1079,22 @@ export default function App() {
             )}
             <TrendingDown size={18} />
             <span className="text-[10px] tracking-wider font-semibold font-display">{TRANSLATIONS[language].navExpenses}</span>
+          </button>
+
+          {/* Tab 3: Cashback */}
+          <button
+            onClick={() => setActiveTab(3)}
+            className={`flex flex-col items-center space-y-1.5 py-2 px-3.5 rounded-2xl relative transition duration-300 cursor-pointer ${activeTab === 3 ? 'text-indigo-400 font-bold scale-105' : 'text-slate-400 hover:text-white'}`}
+          >
+            {activeTab === 3 && (
+              <motion.div
+                layoutId="active-tab-glow"
+                className="absolute inset-0 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl -z-10"
+                transition={{ type: 'spring', stiffness: 350, damping: 25 }}
+              />
+            )}
+            <BadgePercent size={18} />
+            <span className="text-[10px] tracking-wider font-semibold font-display">{TRANSLATIONS[language].navCashback}</span>
           </button>
 
         </nav>
